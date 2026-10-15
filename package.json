@@ -1,8 +1,8 @@
 {
   "name": "dsh-plugin-opencode-usage",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
-  "description": "OpenCode usage in the DSH Web composer dock — rolling, weekly and monthly quota rows under the chat input",
+  "description": "OpenCode usage and prepaid credit in the DSH Web composer dock — rolling, weekly and monthly quota rows plus available credit under the chat input",
   "type": "module",
   "main": "lib/index.js",
   "exports": {

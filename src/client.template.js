@@ -164,6 +164,21 @@ window.__ModuleLoader__.load({
           React.createElement('span', { className: 'dshOpencodeUsageNote', key: 'note' }, noteFor(state)),
         )
       }
+      // Optional fourth row: prepaid console credit. The host attaches it only
+      // when the billing route accepted the key, so its absence is a hidden
+      // row, not an error; the same last-known-good persistence as the usage
+      // rows applies (state.credit is null while none is known).
+      const creditText = formatCreditDollarsText(state.credit)
+      if (creditText !== null) {
+        children.push(
+          React.createElement(
+            'span',
+            { className: 'dshOpencodeUsageRow', key: 'credit' },
+            React.createElement('span', { className: 'dshOpencodeUsageLabel' }, 'Available credit'),
+            React.createElement('span', { className: 'dshOpencodeUsagePercent' }, creditText),
+          ),
+        )
+      }
 
       return React.createElement(
         'div',
@@ -212,6 +227,8 @@ window.__ModuleLoader__.load({
       reduceNoKey,
       reduceOk,
       formatUsageRows,
+      formatCreditDollarsText,
+      normalizeCredit,
       toNormalizedPayload,
       STATE,
     }

@@ -10,6 +10,10 @@ import {
   formatPercentText,
   formatResetText,
   formatUsageRows,
+  formatCreditDollarsText,
+  normalizeCredit,
+  MICRO_CENTS_PER_DOLLAR,
+  toNormalizedPayload,
   initialState,
   reduceError,
   reduceLoading,
@@ -209,6 +213,61 @@ const smuggled = formatUsageRows({ ...SAMPLE, apiKey: 'SHOULD-NOT-SURVIVE' }, NO
 eq(JSON.stringify(smuggled).includes('SHOULD-NOT-SURVIVE'), false, 'unknown payload fields are dropped')
 eq(Object.keys(smuggled?.[0] ?? {}).join(','), 'label,percentText,resetText', 'rows expose exactly three fields')
 eq(USAGE_WINDOWS.length, 3, 'three usage windows are defined')
+
+// ---- 7. Credit normalization -------------------------------------------------
+// Console shape verified live 2026-10-15: string micro-cents, "$4.54" rendered.
+const LIVE_CREDIT = 454_030_592 // the real reading when this unit was verified
+eq(normalizeCredit({ availableMicroCents: LIVE_CREDIT })?.availableMicroCents, LIVE_CREDIT, 'numeric micro-cents accepted')
+eq(normalizeCredit({ availableMicroCents: `${LIVE_CREDIT}` }).availableMicroCents, LIVE_CREDIT, 'string micro-cents accepted')
+eq(normalizeCredit({ availableMicroCents: 454030592.4 }).availableMicroCents, 454030592, 'fractional upstream is rounded to an integer')
+eq(normalizeCredit(null), null, 'null credit is a valid hide marker')
+eq(normalizeCredit(undefined), null, 'undefined credit hides')
+eq(normalizeCredit({}), null, 'missing availableMicroCents hides')
+eq(normalizeCredit({ availableMicroCents: -1 }), null, 'negative credit hides')
+eq(normalizeCredit({ availableMicroCents: 'nonsense' }), null, 'garbage string hides')
+eq(normalizeCredit({ availableMicroCents: Number.POSITIVE_INFINITY }), null, 'infinite credit hides')
+eq(normalizeCredit({ availableMicroCents: '5e20' }), null, 'unsafely large credit hides')
+eq(normalizeCredit('pie'), null, 'string credit hides')
+eq(normalizeCredit({ apiKey: 'SHOULD-NOT-SURVIVE', availableMicroCents: 5 })?.availableMicroCents, 5, 'credit is canonicalized by projection — its value survives')
+
+// ---- 8. Credit dollar text ---------------------------------------------------
+eq(formatCreditDollarsText(LIVE_CREDIT), '$4.54', 'live console reading renders $4.54')
+eq(formatCreditDollarsText(5_000_000_000), '$50.00', 'exact dollars get two decimals')
+eq(formatCreditDollarsText(250_000_000), '$2.50', 'exact dollars get two decimals (2)')
+eq(formatCreditDollarsText(0), '$0.00', 'zero balance still renders, not hidden')
+eq(formatCreditDollarsText(1), '$0.00', 'one micro-cent rounds to zero dollars visibly')
+eq(formatCreditDollarsText(-1), null, 'negative is not a balance')
+eq(formatCreditDollarsText('4.54'), null, 'strings are not numbers here')
+eq(formatCreditDollarsText(Number.NaN), null, 'NaN is not a balance')
+eq(MICRO_CENTS_PER_DOLLAR, 100_000_000, 'scale matches the verified console page')
+
+// ---- 9. Credit rides through normalization and the state machine -------------
+const WITH_CREDIT = { ...SAMPLE, credit: { availableMicroCents: LIVE_CREDIT } }
+eq(toNormalizedPayload(WITH_CREDIT)?.credit?.availableMicroCents, LIVE_CREDIT, 'credit passes the whitelisted extension')
+eq(JSON.stringify(toNormalizedPayload({ ...SAMPLE, credit: { availableMicroCents: LIVE_CREDIT, apiKey: 'NOPE' } })?.credit).includes('NOPE'), false, 'extra credit fields cannot carry an attached value across')
+eq(toNormalizedPayload({ ...SAMPLE, credit: { availableMicroCents: 'no' } })?.credit, null, 'unparseable credit hides, usage survives')
+eq(toNormalizedPayload(SAMPLE)?.credit, undefined, 'legacy host bodies normalize with NO credit key at all')
+
+let creditState = initialState()
+eq(creditState.credit, null, 'initial state hides credit')
+creditState = reduceOk(creditState, WITH_CREDIT, NOW)
+eq(creditState.status, STATE.OK, 'credit payload -> ok')
+eq(creditState.credit, LIVE_CREDIT, 'ok state carries the credit number')
+eq(formatCreditDollarsText(creditState.credit), '$4.54', 'credit renders the verified dollars text')
+eq(creditState.rows?.length, 3, 'credit does not change the three usage rows')
+creditState = reduceNoKey(creditState)
+eq(creditState.credit, LIVE_CREDIT, 'no-key keeps last-known-good credit')
+creditState = reduceError(creditState, 'boom')
+eq(creditState.credit, LIVE_CREDIT, 'error keeps last-known-good credit')
+creditState = reduceOk(creditState, SAMPLE, NOW)
+eq(creditState.credit, null, 'a limbless recovery payload hides credit again')
+creditState = reduceLoading(creditState)
+eq(creditState.credit, null, 'credit null persists into loading')
+
+// A credit body that is malformed NEVER fails the usage payload.
+let guarded = reduceOk(initialState(), { ...SAMPLE, credit: 'pie-shaped' }, NOW)
+eq(guarded?.status, STATE.OK, 'garbage credit does not fail the usage payload')
+eq(guarded.credit, null, 'garbage credit hides')
 
 // ---- Result -----------------------------------------------------------------
 if (failures === 0) {

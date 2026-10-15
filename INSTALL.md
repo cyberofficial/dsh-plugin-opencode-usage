@@ -28,13 +28,17 @@ and `pnpm install` accepts no package names — see [Command validation](#6-comm
 
 ## 3. Restart `dsh web`
 
-Stop and start `dsh web` as you normally do, then start this GUI again.
+Corrected against live evidence (2026-10-12): a NEW plugin in this DSH build
+**hot-loaded without a server restart** — the pill appeared on a page reload
+while the server had been up the whole time. So for a first install, a page
+reload may be all you need.
 
-Why it is required: the install adds a **profile dependency**, and a profile
-dependency change is not hot-reloaded. Until the restart, the new row is not in
-the running loader and neither half of the plugin exists in the live process —
-the browser bundle will not be served and the host route will not be registered.
-A page reload alone is not enough.
+A restart is still required in ONE case: **updating an already-installed
+plugin's host-half code**. This credit-row release (v0.2.0) changes
+`lib/index.js` on the host; the running server holds the old module until you
+restart `dsh web`. Until then the usage rows keep working and the credit row
+stays hidden. A restart is also the guaranteed way to pick up any pending
+scrubbing fixes.
 
 ## 4. Reload the page
 
@@ -59,13 +63,14 @@ dsh plugin --profile web why dsh-plugin-opencode-usage
 
 ## 6. What "working" looks like
 
-After the restart and reload, a pill appears in the composer dock — the ambient
+After the install and a page reload, a pill appears in the composer dock — the ambient
 row under the chat input, below the session-stats strip — reading:
 
 ```
 OpenCode   Rolling usage  9% used    Resets in 0h 10m
            Weekly usage   17% used   Resets in 6d 1h
            Monthly usage  9% used    Resets in 30d 13h
+           Available credit $4.54
 ```
 
 The numbers are yours and will differ; the **format** is what to check:
@@ -75,6 +80,15 @@ The numbers are yours and will differ; the **format** is what to check:
 | 5-hour window | `Rolling usage` | `<n>% used` | `Resets in <h>h <m>m` under a day, e.g. `Resets in 0h 10m` |
 | weekly window | `Weekly usage` | `<n>% used` | `Resets in <d>d <h>h`, e.g. `Resets in 6d 1h` |
 | monthly window | `Monthly usage` | `<n>% used` | `Resets in <d>d <h>h`, e.g. `Resets in 30d 13h` |
+| prepaid balance | `Available credit` | `$<x.xx>` | none |
+
+The credit row is **optional by design**: it appears only when the console
+billing route accepted the stored key (`Available credit / $4.54`, the same
+number the opencode.ai billing page shows as "$x.xx left"). Its absence means
+the billing route declined the key or required a workspace id the plugin cannot
+derive — it is not an error, and the three usage rows keep working.
+Remove grade: set `"credit": false` in the plugin config to disable the billing
+request entirely.
 
 `0h` in the rolling row is correct, not a bug: a reset under an hour always shows
 `0h <m>m`. The three rows appear as soon as the host answers; the pill refreshes
@@ -87,8 +101,9 @@ While it is still loading, or if it has nothing to show, the pill reads
 
 ### If the pill is absent
 
-1. **Did `dsh web` actually restart after the install?** This is the usual cause —
-   without it, neither half is loaded.
+1. **Did the page get a hard reload after the install?** A stale cached bundle is
+   the usual first suspect. (A restart is only needed for a host-side code
+   change to an already-installed plugin — see §3.)
 2. Hard-reload the page (`Ctrl`+`Shift`+`R`) to drop the cached bundle.
 3. Confirm the dependency is really in the profile:
    `dsh plugin --profile web why dsh-plugin-opencode-usage`
@@ -121,6 +136,11 @@ While it is still loading, or if it has nothing to show, the pill reads
 - **Not yet proven end to end.** No install was run and the pill has never been
   rendered against the live server — task-3 verified it offline (unit + built-bundle
   tests) and this document for the install path only.
+- **The credit row rides less-contractual console routes.** `/console/api/*`
+  billing routes are undocumented; they were probed live on 2026-10-15 and the
+  whole set of possible failures (Bearer key class rejected, `org_required`
+  unresolvable, shape drift) degrades to a hidden row. If the credit row never
+  appears while usage rows do, that is the honest finding — not a pill bug.
 
 ## 8. Command validation
 

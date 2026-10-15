@@ -7,8 +7,11 @@
 import {
   ROUTE_PATH,
   USAGE_URL,
+  CREDIT_URL,
+  CREDIT_ORGS_URL,
   apply,
   carriesSecret,
+  fetchCredit,
   fetchUsage,
   normalizeUsage,
   registerSecret,
@@ -269,9 +272,9 @@ function routeFor(config, credentials) {
 }
 
 let upstreamCalls = 0
-const countingFetch = async () => {
-  upstreamCalls += 1
-  return jsonResponse(200, SAMPLE_BODY)
+const countingFetch = async (url) => {
+  if (String(url) === USAGE_URL) upstreamCalls += 1
+  return String(url) === USAGE_URL ? jsonResponse(200, SAMPLE_BODY) : jsonResponse(200, {})
 }
 const okRoute = routeFor({ fetchImpl: countingFetch, cacheMs: 60_000 }, fakeCredentials({ resolve: async () => ({ value: CANARY }) }))
 
@@ -492,7 +495,8 @@ const leakCtx = {
 }
 apply(leakCtx, {
   cacheMs: 0,
-  fetchImpl: async () => {
+  fetchImpl: async (url) => {
+    if (String(url) !== USAGE_URL) throw new Error('credit transport denied (no orchestrated data)')
     leakCalls += 1
     throw new Error(`transport echoed ${CANARY} (no Bearer prefix)`)
   },
@@ -503,6 +507,174 @@ eq(leakCalls, 1, 'the leaking transport was exercised')
 ok(!leakRes.out.body.includes(CANARY), 'the SERVED PAYLOAD carries no key material')
 ok(!leakLogs.join('\n').includes(CANARY), 'the HOST LOG carries no key material')
 eq(JSON.parse(leakRes.out.body).error.message, 'transport echoed <redacted> (no Bearer prefix)', 'the payload carries the scrubbed message')
+
+// ---- 9. Credit: route wiring, org discovery, hide-on-failure, numbers-only --
+// Console shape verified live 2026-10-15 (the Playwright probe): string
+// micro-cents, 1 µ¢ = $1e-8. The fake ids below are assembled at runtime.
+const FAKE_WS = ['wrk', 'test', 'org'].join('_')
+const CREDIT_BODY = {
+  billingMode: 'prepaid',
+  mode: 'pay-as-you-go',
+  balanceMicroCents: '454030592',
+  availableMicroCents: '454030592',
+  creditLimitMicroCents: null,
+}
+const ORG_OK_BODY = [{ id: FAKE_WS, name: 'TestOrg' }]
+const ORG_REQUIRED_ERROR = { _tag: 'OrgRequired', code: 'org_required', message: 'x-org-id is required' }
+
+/** Counters by URL family so usage and credit are asserted independently. */
+function makeState() {
+  return { usage: 0, status: 0, orgs: 0 }
+}
+
+/**
+ * The dispatching fetch used by the route-level credit tests.
+ * @param mode - `ok` | `org_required_then_ok` | `auth` | `shape` | `garbage`.
+ */
+function creditFetchFor(mode) {
+  const calls = makeState()
+  const seen = []
+  const fetch = async (url, init) => {
+    const target = String(url)
+    seen.push({ url: target, method: init?.method, headers: { ...(init?.headers ?? {}) }, body: init?.body ?? null })
+    if (target === USAGE_URL) {
+      calls.usage += 1
+      return jsonResponse(200, SAMPLE_BODY)
+    }
+    if (target === CREDIT_URL) {
+      calls.status += 1
+      const statusCall = calls.status
+      if (mode === 'auth') return jsonResponse(401, { _tag: 'Unauthorized' })
+      if (mode === 'shape') return jsonResponse(200, {})
+      if (mode === 'garbage') return jsonResponse(200, { availableMicroCents: 'pie' })
+      if (mode === 'org_required_then_ok' && statusCall === 1) return jsonResponse(400, ORG_REQUIRED_ERROR)
+      return jsonResponse(200, CREDIT_BODY)
+    }
+    if (target === CREDIT_ORGS_URL) {
+      calls.orgs += 1
+      return jsonResponse(200, ORG_OK_BODY)
+    }
+    throw new Error(`unexpected upstream URL: ${target}`)
+  }
+  return { fetch, calls, seen }
+}
+
+/** Fetch the credit reading directly (module export, same shape as fetchUsage). */
+let directCredit
+let directCreditSeen = null
+try {
+  directCredit = await fetchCredit({
+    apiKey: CANARY,
+    fetchImpl: async (url, init) => {
+      directCreditSeen = { url: String(url), headers: { ...(init?.headers ?? {}) }, body: init?.body ?? null }
+      return jsonResponse(200, CREDIT_BODY)
+    },
+  })
+} catch (caught) {
+  directCredit = caught
+}
+eq(directCredit?.availableMicroCents, 454030592, 'fetchCredit returns the micro-cent number')
+eq(directCreditSeen?.url, CREDIT_URL, 'fetchCredit calls the billing status URL')
+eq(directCreditSeen?.headers?.Authorization, `Bearer ${CANARY}`, 'fetchCredit sends the key as a Bearer header')
+ok(directCreditSeen?.headers?.['x-org-id'] === undefined, 'the first bare-bearer attempt sends no x-org-id')
+ok(!String(directCreditSeen?.url).includes(CANARY), 'the key is not in the credit URL')
+ok(!JSON.stringify(directCreditSeen?.body ?? null).includes(CANARY), 'the key is not in the credit question')
+for (const status of [401, 403, 500]) {
+  let error
+  try {
+    await fetchCredit({ apiKey: CANARY, fetchImpl: async () => jsonResponse(status, {}) })
+  } catch (caught) {
+    error = caught
+  }
+  eq(error?.kind, status === 401 ? 'auth' : status === 403 ? 'entitlement' : 'http', `fetchCredit maps HTTP ${status} to a kind`)
+  ok(!String(error?.message).includes(CANARY), `fetchCredit HTTP ${status} message carries no key`)
+}
+let creditTransportError
+try {
+  await fetchCredit({ apiKey: CANARY, fetchImpl: async () => { throw new Error('credit socket closed') } })
+} catch (caught) {
+  creditTransportError = caught
+}
+eq(creditTransportError?.message, 'credit socket closed', 'fetchCredit rethrows transport failures')
+
+// Route level: the credit row rides the SAME payload, numbers only.
+// NOTE on order: this happy-path route runs FIRST in the suite, while the
+// process-level workspace cache is still unset, so its carrier proves the
+// bare-bearer attempt.
+{
+  const harness = creditFetchFor('ok')
+  const route = routeFor({ fetchImpl: harness.fetch, cacheMs: 0 }, fakeCredentials({ resolve: async () => ({ value: CANARY }) }))
+  const res = fakeRes()
+  await route.handler({ url: ROUTE_PATH }, res)
+  const body = JSON.parse(res.out.body)
+  eq(body.status, 'ok', 'credit route reports status ok')
+  eq(body.payload.credit?.availableMicroCents, 454030592, 'the payload carries the credit number')
+  eq(JSON.stringify(body.payload.credit), '{"availableMicroCents":454030592}', 'credit crosses as its number-only shape')
+  eq(harness.calls.usage, 1, 'usage fetched once')
+  eq(harness.calls.status, 1, 'billing status fetched once')
+  eq(harness.calls.orgs, 0, 'org discovery NOT needed on the happy path')
+  const statusCall = harness.seen.find((call) => call.url === CREDIT_URL)
+  eq(statusCall?.headers?.Authorization, `Bearer ${CANARY}`, 'the billing call uses the Bearer header')
+  ok(statusCall?.headers?.['x-org-id'] === undefined, 'the billing call sends no x-org-id on the bare attempt')
+  ok(!res.out.body.includes(CANARY), 'THE CREDIT-CARRYING BODY DOES NOT CONTAIN THE CREDENTIAL VALUE')
+}
+
+// The org_required path: discover the workspace with the SAME key, retry once.
+{
+  const harness = creditFetchFor('org_required_then_ok')
+  const route = routeFor({ fetchImpl: harness.fetch, cacheMs: 0 }, fakeCredentials({ resolve: async () => ({ value: CANARY }) }))
+  const res = fakeRes()
+  await route.handler({ url: ROUTE_PATH }, res)
+  const body = JSON.parse(res.out.body)
+  eq(body.payload.credit?.availableMicroCents, 454030592, 'org_required resolves through discovery and retry')
+  eq(harness.calls.status, 2, 'the status route is called twice (bare + with org)')
+  eq(harness.calls.orgs, 1, 'org discovery called exactly once')
+  const orgCall = harness.seen.find((call) => call.url === CREDIT_ORGS_URL)
+  eq(orgCall?.headers?.Authorization, `Bearer ${CANARY}`, 'org discovery uses the same Bearer header')
+  ok(orgCall?.headers?.['x-org-id'] === undefined, 'org discovery itself needs no x-org-id')
+  const retryCall = harness.seen.filter((call) => call.url === CREDIT_URL)[1]
+  eq(retryCall?.headers?.['x-org-id'], FAKE_WS, 'the retry sends the discovered workspace id')
+  ok(!res.out.body.includes(CANARY), 'the org-discovery body carries no credential value')
+}
+
+// On ANY credit failure the payload still serves usage with credit null.
+for (const [name, mode] of [['401', 'auth'], ['unexpected shape', 'shape'], ['garbage credit', 'garbage']]) {
+  const harness = creditFetchFor(mode)
+  const logs = []
+  const ctx = {
+    logger: { warn: (...args) => logs.push(args.join(' ')) },
+    get: (serviceName) => (serviceName === 'credentials' ? fakeCredentials({ resolve: async () => ({ value: CANARY }) }) : undefined),
+    effect: (fn) => {
+      fn()
+      return () => {}
+    },
+    webServer: { register: (route) => { ctx.route = route; return () => {} } },
+  }
+  apply(ctx, { cacheMs: 0, fetchImpl: harness.fetch })
+  const res = fakeRes()
+  await ctx.route.handler({ url: ROUTE_PATH }, res)
+  const body = JSON.parse(res.out.body)
+  eq(body.status, 'ok', `a credit failure (${name}) does not fail the usage payload`)
+  eq(body.payload.credit, null, `a credit failure (${name}) hides the credit row`)
+  eq(body.payload.rolling.percent, 9, `the usage numbers ride on (${name})`)
+  ok(!res.out.body.includes(CANARY), `no credential value in the (${name}) body`)
+  ok(logs.length >= 1, `the credit failure (${name}) is logged`)
+  ok(!logs.join('\n').includes(CANARY), `the log line for (${name}) carries no credential value`)
+}
+
+// `credit: false` opts out entirely: the billing route is never touched.
+{
+  const harness = creditFetchFor('ok')
+  const route = routeFor({ credit: false, fetchImpl: harness.fetch, cacheMs: 0 }, fakeCredentials({ resolve: async () => ({ value: CANARY }) }))
+  const res = fakeRes()
+  await route.handler({ url: ROUTE_PATH }, res)
+  const body = JSON.parse(res.out.body)
+  eq(body.status, 'ok', 'credit-disabled route still reports ok')
+  eq(body.payload.credit, null, 'credit-disabled payload has no credit')
+  eq(harness.calls.status, 0, 'the billing route is never called when credit is disabled')
+  eq(harness.calls.orgs, 0, 'no org discovery when credit is disabled')
+  eq(harness.calls.usage, 1, 'usage is still fetched when credit is disabled')
+}
 
 // ---- Result ------------------------------------------------------------------
 if (failures === 0) {
